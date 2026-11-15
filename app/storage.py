@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import io
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -13,6 +14,14 @@ from . import config
 
 class CsvValidationError(ValueError):
     """Raised when an uploaded CSV does not satisfy the ingestion contract."""
+
+
+class LeaseLostError(RuntimeError):
+    """Raised when a worker no longer owns the shard lease.
+
+    A successor instance has taken over the shard, so this incarnation must
+    not touch any of its files or rows.
+    """
 
 
 @dataclass(frozen=True)
@@ -106,6 +115,17 @@ def staging_path(shard_id: int, task_id: str) -> Path:
     return config.STAGING_DIR / f"shard-{shard_id:04d}.{safe}.tmp.csv"
 
 
+def list_staging_files(shard_id: int) -> list[Path]:
+    """All staging files for a shard (from any incarnation/owner)."""
+    return sorted(config.STAGING_DIR.glob(f"shard-{shard_id:04d}.*.tmp.csv"))
+
+
+def staging_shard_id(path: Path) -> int | None:
+    """Extract the shard id from a staging file name, or None if unrelated."""
+    match = re.match(r"shard-(\d+)\..*\.tmp\.csv$", path.name)
+    return int(match.group(1)) if match else None
+
+
 def source_path(source_file: str) -> Path:
     # source_file is generated server-side, never user supplied; guard anyway.
     if "/" in source_file or ".." in source_file:
@@ -127,22 +147,18 @@ def read_source_rows(source_file: str) -> list[tuple[str, str, str]]:
         return [(r[0], r[1], r[2]) for r in reader if r]
 
 
-def swap_staged_shard(shard_id: int, staged: Path, target: Path) -> None:
-    """Publish a purified shard.
+def publish_staged_shard(staged: Path, target: Path) -> None:
+    """Publish a purified shard by atomically replacing the downloadable file.
 
-    Contract from the spec: before completion, remove the old downloadable
-    file and any stale staging files, and only then make the purified file
-    visible. The shard has already been marked WITHHELD in the database, so
-    new downloads are rejected regardless of file presence.
+    The old shard is *not* unlinked first: ``os.replace`` is atomic, so a
+    downloader either sees the previous complete file or the new complete
+    one, never a missing path. Stale staging files are deliberately left
+    untouched here - cleanup is the lease owner's responsibility and only
+    happens once a lease is proven expired, so a lagging worker can never
+    delete files another live instance is using.
     """
-    if target.exists():
-        target.unlink()
-    for stale in config.STAGING_DIR.glob(f"shard-{shard_id:04d}.*.tmp.csv"):
-        if stale != staged:
-            stale.unlink()
-    _fsync_dir(config.SHARD_DIR)
     os.replace(staged, target)
-    _fsync_dir(config.SHARD_DIR)
+    _fsync_dir(target.parent)
     _fsync_dir(config.STAGING_DIR)
 
 

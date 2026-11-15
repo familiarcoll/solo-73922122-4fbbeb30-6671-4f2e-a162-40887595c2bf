@@ -6,11 +6,15 @@ shared volume.
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
+import time
 from contextlib import contextmanager
 from typing import Iterator
 
 from . import config
+
+logger = logging.getLogger("db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -64,6 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_ws_shard ON withdrawal_shards(shard_id);
 CREATE TABLE IF NOT EXISTS shard_leases (
     shard_id    INTEGER PRIMARY KEY,
     owner       TEXT NOT NULL,
+    incarnation TEXT NOT NULL,
     task_id     TEXT NOT NULL,
     leased_at   TEXT NOT NULL,
     heartbeat_at TEXT NOT NULL
@@ -87,15 +92,35 @@ def connect() -> sqlite3.Connection:
         check_same_thread=False,
     )
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=FULL")
+    # busy_timeout must be set first so ordinary lock contention waits rather
+    # than failing immediately.
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
+    # Switching journal_mode takes an exclusive lock and does not honour
+    # busy_timeout on every SQLite build, so two instances starting at the
+    # same instant can race here. Retry briefly; once the mode is WAL it is
+    # persisted and every later connection is a no-op.
+    for attempt in range(5):
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            break
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt == 4:
+                raise
+            time.sleep(0.2 * (attempt + 1))
+    conn.execute("PRAGMA synchronous=FULL")
     return conn
 
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    # Migration for databases created before per-owner fencing existed: the
+    # incarnation column disambiguates a live owner from a stale lease row.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(shard_leases)")}
+    if "incarnation" not in cols:
+        conn.execute(
+            "ALTER TABLE shard_leases ADD COLUMN incarnation TEXT NOT NULL DEFAULT ''"
+        )
 
 
 @contextmanager

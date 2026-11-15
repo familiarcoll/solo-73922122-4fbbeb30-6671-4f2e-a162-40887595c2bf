@@ -1,14 +1,26 @@
 # Two API instances sharing one volume (CSV files + SQLite database).
 # Both containers mount the same named volume at /data and coordinate through
-# SQLite write transactions plus per-shard leases.
+# SQLite write transactions plus per-shard, incarnation-fenced leases.
+#
+# Rolling-restart safety: a newly started instance only reclaims leases whose
+# heartbeat is older than LEASE_TIMEOUT_SECONDS. It never deletes a live peer's
+# staging files, and a lagging worker whose lease was taken over fences every
+# file operation and backs off instead of touching the successor's result.
+x-api-env: &api-env
+  DATA_DIR: /data
+  WORKER_INTERVAL_SECONDS: "0.1"
+  # Lease heartbeat deadline. A peer may take over only after a lease has been
+  # silent for this long, so live instances are never disturbed.
+  LEASE_TIMEOUT_SECONDS: "30"
+  TASK_TIMEOUT_SECONDS: "120"
+
 services:
   api-a:
     build: .
     image: feature-withdrawal:latest
     environment:
+      <<: *api-env
       INSTANCE_ID: api-a
-      DATA_DIR: /data
-      WORKER_INTERVAL_SECONDS: "0.1"
     ports:
       - "8001:8000"
     volumes:
@@ -28,9 +40,8 @@ services:
     image: feature-withdrawal:latest
     build: .
     environment:
+      <<: *api-env
       INSTANCE_ID: api-b
-      DATA_DIR: /data
-      WORKER_INTERVAL_SECONDS: "0.1"
     ports:
       - "8002:8000"
     volumes:

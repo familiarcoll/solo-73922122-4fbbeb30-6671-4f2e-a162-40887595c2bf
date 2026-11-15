@@ -15,6 +15,9 @@ CSV 存共享卷，SQLite 只存索引和状态，Docker Compose 双实例部署
 | 重写分片只删目标行 | 净化分片由 SQLite 索引 + 源 CSV **重建**，显式过滤撤回 subject，其余行内容与顺序保持 |
 | 完成前清旧件/暂存再开放净化分片 | 换片顺序：写暂存(fsync) → 删旧件与过期暂存 → rename 落位 → 事务删索引并按条件恢复 `AVAILABLE` |
 | 双实例并发撤回不同人不得相互恢复数据 | 所有写操作走 `BEGIN IMMEDIATE` 串行化 + 分片租约；分片仅在"无未完成撤回"时才恢复可用，净化数据永远由当前索引重建 |
+| 滚动重启：新实例不得清理另一在用实例的文件 | 启动恢复只回收**心跳超时**的租约；活动租约与其暂存文件一律保留，新实例启动即可查询任务，不等待任何在途净化 |
+| 迟到旧工作不得删除/覆盖接手方结果 | 租约带进程级 `incarnation` 围栏：暂存、换片、改索引、源文件净化前都在写事务内复核所有权，失主即抛 `LeaseLostError` 放弃；换片用 `os.replace` 原子覆盖，绝不先 unlink 成品 |
+| 真中断后自动接续，未净化完保持停供 | 崩溃者租约心跳超时后任意实例可接管续做；完成前分片在 DB 始终 `WITHHELD`，下载持续 `409`，完成后恢复 `200` |
 | 写盘失败/进程中断后受影响分片保持停供，重启续做 | 换片前后分片在 DB 中始终 `WITHHELD`；启动恢复清租约、回收 `RUNNING`/`PROCESSING` 状态、清暂存，后台工作器重试 |
 | 重复撤回复用任务 | 同 subject 第二次请求直接返回首个 `task_id`（`reused=true`），不新建任务 |
 | Docker Compose 双实例 + /docs | 见 `docker-compose.yml`；根路径 `/` 重定向到 `/docs`（Swagger UI） |
@@ -91,12 +94,20 @@ DATA_DIR=./data uvicorn app.main:app --port 8000
 4. **净化只删目标行且永不复活数据**：新分片内容始终由**当前索引**重建并显式排除撤回主体，
    不依赖旧分片文件；分片恢复 `AVAILABLE` 的条件是该分片已无任何未完成撤回。两个不同主体的
    并发撤回因此无法互相把对方的数据写回。
-5. **换片顺序**：暂存文件 `tmp+fsync+rename` 原子落盘 → 删旧下载件和过期暂存 → rename 发布
-   （目录 fsync）。若中途失败，DB 仍为 `WITHHELD`，下载保持停供，工作器重试。
-6. **启动恢复**：清空租约、把遗留 `RUNNING` 分片和含未完成分片的任务回收为 `PENDING`、
-   删除暂存残留、清理未完成建库的孤儿文件，然后后台自动续做。
-7. **源 CSV 净化**：任务全部分片完成后，按 subject 过滤重写源 CSV（原子替换）；索引按
-   `sample_id` 映射源行，不受行号变化影响。
+5. **换片顺序与围栏**：暂存文件 `tmp+fsync` 原子落盘 → 在写事务内复核本实例仍持有租约 →
+   `os.replace` 原子覆盖成品（目录 fsync），**绝不先 unlink 下载件**，下载者只会看到旧文件
+   或新文件，不会遇到缺失路径。若中途失败或租约已失，DB 仍为 `WITHHELD`，下载保持停供。
+6. **启动恢复（滚动重启安全）**：只清理**心跳早于 `LEASE_TIMEOUT_SECONDS`** 的死租约，并把
+   这些死租约名下的 `RUNNING` 分片/任务回收为 `PENDING`；活动实例的租约、暂存文件一律不动，
+   孤儿暂存也只在"无活动租约且文件早于超时"时才回收。新实例启动后立刻可查任务，无需等待
+   在途净化。真正崩溃的实例租约到期后由任意实例自动接管续做。
+7. **租约围栏（fencing）**：`shard_leases` 记录 `owner` + 进程唯一 `incarnation`。每个触碰
+   文件的步骤（写暂存、换片、删索引、源 CSV 重写）前后都在 `BEGIN IMMEDIATE` 事务内校验
+   `(owner, incarnation)` 仍匹配，失主即抛 `LeaseLostError` 并静默放弃，因此一个醒来的旧工作
+   永远无法删除或覆盖接手方已发布的结果。
+8. **源 CSV 净化**：任务全部分片完成后，在单个写事务区间内按 subject 过滤、原子重写源 CSV，
+   两实例在 SQLite 写锁上串行，杜绝并发撤回互相覆盖源文件；索引按 `sample_id` 映射源行，
+   不受行号变化影响。
 
 > 共享卷需支持 POSIX 文件锁与 `fsync`（Docker named volume / 块存储均可；某些 NFS 默认
 > 配置下锁语义较弱，生产应选用支持锁的卷驱动）。
@@ -108,20 +119,25 @@ pip install pytest httpx
 pytest -q
 ```
 
-14 个测试全部使用真实 uvicorn 子进程：
+16 个测试全部使用真实 uvicorn 子进程：
 
 - `test_api.py`（7）：文档入口、上传限额/校验、完整撤回流程、重复撤回复用、
   未知主体空任务、1000 行边界与建库封闭、重写只删目标行并保持顺序
 - `test_concurrency.py`（3）：两实例并发撤回不同主体、二次撤回不复活首次数据、
   并发建库只有一个赢家
-- `test_recovery.py`（4）：净化中途硬退出（`os._exit` 模拟 SIGKILL）后重启续做、
+- `test_recovery.py`（3）：净化中途硬退出（`os._exit` 模拟 SIGKILL）后重启续做、
   共享卷只读（写盘失败）时分片持续停供且恢复后自动完成、无待办时重启干净
+- `test_rolling_restart.py`（2）：A 净化停滞、B 在租约超时后接管完成，A 醒来不得删除或
+  覆盖 B 的成品（复现题面"任务 COMPLETED/分片 AVAILABLE/下载 409"缺陷）；新实例启动不得
+  回收活动实例的暂存、且立即能查任务
 
-测试管理端点 `/test-admin/stop`、`/test-admin/hard-exit` 仅在 `ENABLE_TEST_ADMIN=1`
-时注册，生产镜像不设置该变量即不存在。
+测试管理端点 `/test-admin/stop`、`/test-admin/hard-exit`、`/test-admin/stall` 仅在
+`ENABLE_TEST_ADMIN=1` 时注册（`stall` 还需 `PURGE_STALL_SECONDS>0`），生产镜像不设置这些
+变量即不存在、不可触发。
 
 ## 已知限制
 
 - 单库上限 3 文件 × 1000 行（按题面约定）；分片目标行数可用 `SHARD_TARGET_ROWS` 调整。
-- 本沙箱环境无 Docker 守护进程，compose 文件已通过 YAML 校验、双实例行为用两个共享
-  同一 `DATA_DIR` 的真实进程等价验证；`docker compose up --build` 未在本机实际执行。
+- 当前环境无 Docker 守护进程，`docker compose up --build` 未在本机实跑；compose 文件已通过
+  YAML 渲染校验，双实例行为用两个共享同一 `DATA_DIR` 的真实 uvicorn 进程做了等价端到端实测
+  （冷启动并行建库、上传/撤回/查询/下载、停滞-接管-复活不破坏成品）。

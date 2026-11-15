@@ -6,6 +6,7 @@ volume when several API instances are running.
 from __future__ import annotations
 
 import os
+import uuid
 from pathlib import Path
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
@@ -40,8 +41,17 @@ PURGE_SWAP_DELAY_SECONDS = float(os.environ.get("PURGE_SWAP_DELAY_SECONDS", "0")
 # Test-only admin endpoints (graceful stop / hard self-exit). Never enable in
 # production deployments.
 ENABLE_TEST_ADMIN = os.environ.get("ENABLE_TEST_ADMIN", "") == "1"
+# Test-only: when non-empty, a worker holding a shard lease sleeps this many
+# seconds at the staging point (staging written, not yet published) when the
+# test-admin stall endpoint is triggered. Simulates a frozen instance whose
+# lease heartbeats stop, letting a peer take over.
+PURGE_STALL_SECONDS = float(os.environ.get("PURGE_STALL_SECONDS", "0"))
 
 INSTANCE_ID = os.environ.get("INSTANCE_ID") or f"pid-{os.getpid()}"
+# Unique per process. Even two containers restarted with the same INSTANCE_ID
+# get different incarnations, so a lagging old worker can never be mistaken
+# for the current lease owner.
+INCARNATION_ID = os.environ.get("INCARNATION_ID") or uuid.uuid4().hex
 
 CSV_HEADER = "subject_id,sample_id,value\n"
 

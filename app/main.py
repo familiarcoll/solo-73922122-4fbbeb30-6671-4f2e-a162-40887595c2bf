@@ -282,6 +282,16 @@ if config.ENABLE_TEST_ADMIN:
         # durability purposes (no flush, no atexit, no buffer flush).
         os._exit(137)
 
+    @app.post("/test-admin/stall", include_in_schema=False)
+    def test_admin_stall() -> JSONResponse:
+        # Make the background worker freeze (without heartbeating) at its next
+        # staging point, so a peer can take over the stale lease while this
+        # process stays alive and later resumes its old work.
+        from . import worker as worker_mod
+
+        worker_mod.stall_injected = True
+        return JSONResponse({"stall": True, "seconds": config.PURGE_STALL_SECONDS})
+
 
 def main() -> None:  # pragma: no cover
     logging.basicConfig(level=logging.INFO)

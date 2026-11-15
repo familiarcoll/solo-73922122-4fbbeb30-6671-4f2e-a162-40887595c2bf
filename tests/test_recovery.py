@@ -27,6 +27,9 @@ def test_sigkill_mid_purge_then_restart_resumes(tmp_data):
         "PURGE_STEP_DELAY_SECONDS": "0.3",
         "PURGE_SWAP_DELAY_SECONDS": "0.8",
         "SHARD_TARGET_ROWS": "25",
+        # Short lease timeout so the dead process's lease is provably stale
+        # when the restarted instance runs startup recovery.
+        "LEASE_TIMEOUT_SECONDS": "2",
     }
     srv = Server(tmp_data, free_port(), env_extra=slow_env)
     srv.wait_ready()
@@ -64,6 +67,7 @@ def test_sigkill_mid_purge_then_restart_resumes(tmp_data):
                 "SHARD_TARGET_ROWS": "25",
                 "PURGE_STEP_DELAY_SECONDS": "0.4",
                 "PURGE_SWAP_DELAY_SECONDS": "0.4",
+                "LEASE_TIMEOUT_SECONDS": "2",
             },
         )
         restarted.wait_ready()
