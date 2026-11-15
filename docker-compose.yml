@@ -1,0 +1,50 @@
+# Two API instances sharing one volume (CSV files + SQLite database).
+# Both containers mount the same named volume at /data and coordinate through
+# SQLite write transactions plus per-shard leases.
+services:
+  api-a:
+    build: .
+    image: feature-withdrawal:latest
+    environment:
+      INSTANCE_ID: api-a
+      DATA_DIR: /data
+      WORKER_INTERVAL_SECONDS: "0.1"
+    ports:
+      - "8001:8000"
+    volumes:
+      - shared-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status==200 else 1)"
+      interval: 5s
+      timeout: 4s
+      retries: 10
+    restart: unless-stopped
+
+  api-b:
+    image: feature-withdrawal:latest
+    build: .
+    environment:
+      INSTANCE_ID: api-b
+      DATA_DIR: /data
+      WORKER_INTERVAL_SECONDS: "0.1"
+    ports:
+      - "8002:8000"
+    volumes:
+      - shared-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status==200 else 1)"
+      interval: 5s
+      timeout: 4s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  shared-data:
